@@ -8,6 +8,7 @@
 #include "functions.h"
 #include "functionslist.h"
 #include "pthread.h"
+#include "stdbool.h"
 /* 
 * Implement all the cflask logic here.
 * 1. web server initialization 
@@ -18,8 +19,61 @@
 */
 
 #define BUFFER_SIZE 1024
+#define QUEUE_SIZE 64
 
+typedef struct{
+	int fds[QUEUE_SIZE];
+	int front;
+	int rear;
+	int count;
+} Queue;
 
+void init_queue(Queue *q){
+	q->front = -1;
+	q->rear = 0;
+	q->count = 0;
+}
+
+bool empty(Queue *q){
+	return (q->front == 0);
+}
+
+bool full(Queue *q){
+	return (q->rear == QUEUE_SIZE);
+}
+
+int enqueue(Queue *q, int value){
+	if(full(q)){
+		perror("Queue full");
+		return -1;
+	}
+	q->fds[q->rear] = value;
+	q->rear = (q->rear+1)%QUEUE_SIZE;
+	q->count++;
+	return 0;
+}
+
+int dequeue(Queue *q){
+	if(empty(q)){
+		perror("Queue empty");
+		return 0;
+	}
+	int value = q->fds[q->front];
+	q->front = (q->front+1)%QUEUE_SIZE;
+    q->count--;	
+	return value;
+}
+
+void print_queue(Queue *q) {
+    printf("Queue (count=%d): ", q->count);
+
+    for (int i = 0; i < q->count; i++) {
+        int index = (q->front + i) % QUEUE_SIZE;
+        printf("%d ", q->fds[index]);
+    }
+
+    printf("\n");
+}
 int request_handler(int client_socket, int pid){
     // Request Accept and Parse
     
@@ -104,8 +158,13 @@ int main(int argc, char* argv[]) {
 			return -1;
 		}
     }
-    // Socket Setup
+	
+	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
+    Queue q;
+	init_queue(&q);
+		
+	// Socket Setup
     if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     	perror("Socket Failure");
 		exit(EXIT_FAILURE);
@@ -126,9 +185,8 @@ int main(int argc, char* argv[]) {
 		exit(EXIT_FAILURE);
 	}
 
-    //printf("Server listening on %d\n",port);
-    //printf("PID: %d\n", getpid());
     printf("cflask [single-threaded] on http://0.0.0.0:%u\n", port);
+
     // Client Socket
     while(1){
         if((client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0){
@@ -136,11 +194,11 @@ int main(int argc, char* argv[]) {
             exit(EXIT_FAILURE);
         }
 
-		if(single_threaded == 0){
+		if(mode == 0){
 			int pid = (int)getpid();
 			request_handler(client_socket, pid);
 		}
-		else if(single_threaded == 1){
+		else if(mode == 1){
 			pthread_t thread;
 
 			if(pthread_create(&thread, NULL, &request_thread, &client_socket) != 0){
@@ -149,7 +207,11 @@ int main(int argc, char* argv[]) {
 			}
 			pthread_detach(thread);
 		}
+
+		else if(mode == 2){
+			enqueue(&q,client_socket);
+			print_queue(&q);
+		}
     }
     return 0;
 }
-    
