@@ -20,6 +20,10 @@
 
 #define BUFFER_SIZE 1024
 #define QUEUE_SIZE 64
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t queue_not_full  = PTHREAD_COND_INITIALIZER;
 
 typedef struct{
 	int fds[QUEUE_SIZE];
@@ -27,19 +31,20 @@ typedef struct{
 	int rear;
 	int count;
 } Queue;
+static Queue q;
 
 void init_queue(Queue *q){
-	q->front = -1;
+	q->front = 0;
 	q->rear = 0;
 	q->count = 0;
 }
 
 bool empty(Queue *q){
-	return (q->front == 0);
+	return (q->count == 0);
 }
 
 bool full(Queue *q){
-	return (q->rear == QUEUE_SIZE);
+	return (q->count == QUEUE_SIZE);
 }
 
 int enqueue(Queue *q, int value){
@@ -108,7 +113,7 @@ int request_handler(int client_socket, int pid){
     		perror("asprintf");
     	}
     }
-    printf("[thread %d] GET %s -> %s\n",pid,req.request_line.uri,http_status);
+    printf("[thread %u] GET %s -> %s\n",pid,req.request_line.uri,http_status);
     
     //printf("%s\n",response);
     
@@ -136,9 +141,31 @@ void *request_thread(void *arg){
 
 	printf("in thread");
 	int client_socket = *(int *)arg;
-	int tid = (int)pthread_self();
+	int tid = (unsigned long int)pthread_self();
 	request_handler(client_socket, tid);
 	return NULL;
+}
+
+void *request_pool(){
+
+	while(1){
+		pthread_mutex_lock(&mutex);
+
+		while(empty(&q)){
+			pthread_cond_wait(&queue_not_empty, &mutex);
+		}
+		
+		int client_fd = dequeue(&q);
+		
+		pthread_cond_signal(&queue_not_full);
+		
+		pthread_mutex_unlock(&mutex);
+		
+		int tid = (unsigned long int)pthread_self();
+		request_handler(client_fd,tid);
+	}
+	return NULL;
+
 }
 
 int main(int argc, char* argv[]) {
@@ -159,11 +186,6 @@ int main(int argc, char* argv[]) {
 		}
     }
 	
-	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    Queue q;
-	init_queue(&q);
-		
 	// Socket Setup
     if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     	perror("Socket Failure");
@@ -188,30 +210,69 @@ int main(int argc, char* argv[]) {
     printf("cflask [single-threaded] on http://0.0.0.0:%u\n", port);
 
     // Client Socket
-    while(1){
-        if((client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0){
-        	perror("Accept Failure");
-            exit(EXIT_FAILURE);
-        }
+	switch(mode){
 
-		if(mode == 0){
-			int pid = (int)getpid();
-			request_handler(client_socket, pid);
-		}
-		else if(mode == 1){
-			pthread_t thread;
+		// Single-threaded mode
+		case 0:
+			while(1){
+				if((client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0){
+					perror("Accept Failure");
+					exit(EXIT_FAILURE);
+				}
 
-			if(pthread_create(&thread, NULL, &request_thread, &client_socket) != 0){
-				perror("Client thread");
-				continue;
+				int pid = (int)getpid();
+				request_handler(client_socket, pid);
 			}
-			pthread_detach(thread);
-		}
 
-		else if(mode == 2){
-			enqueue(&q,client_socket);
-			print_queue(&q);
-		}
-    }
+		// Multi-threaded mode
+		case 1:
+			while(1){
+				if((client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0){
+					perror("Accept Failure");
+					exit(EXIT_FAILURE);
+				}
+
+				pthread_t thread;
+
+				if(pthread_create(&thread, NULL, &request_thread, &client_socket) != 0){
+					perror("Client thread");
+					continue;
+				}
+				pthread_detach(thread);
+			}
+
+		// Threadpool mode
+		case 2:
+			init_queue(&q);
+			
+			int nthread = atoi(argv[3]);
+
+			for(int i = 0; i<nthread; i++){
+				pthread_t thread;
+				
+				if(pthread_create(&thread, NULL, &request_pool, NULL) != 0){
+					perror("Client thread");
+					continue;
+				}
+				pthread_detach(thread);
+			}
+
+			while(1){
+				if((client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0){
+					perror("Accept Failure");
+					exit(EXIT_FAILURE);
+				}
+				pthread_mutex_lock(&mutex);
+				
+				while(full(&q)){
+					pthread_cond_wait(&queue_not_full,&mutex);	
+				}
+
+				enqueue(&q,client_socket);
+				pthread_cond_signal(&queue_not_empty);
+				pthread_mutex_unlock(&mutex);
+			}
+	}
+
     return 0;
 }
